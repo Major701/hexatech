@@ -435,10 +435,10 @@ vagrant snapshot restore GOAD-Mini-DC01 clean          # или просто о�
 
 ---
 
-## Источники
-
-- [Документация лабы GOAD-Mini](https://orange-cyberdefense.github.io/GOAD/labs/GOAD-Mini/) — каноническая таблица пользователей/ACL, использованная выше
-- [Репозиторий GOAD](https://github.com/Orange-Cyberdefense/GOAD)
-- [Инструкции по установке GOAD](https://orange-cyberdefense.github.io/GOAD/installation/) и [провайдеры](https://orange-cyberdefense.github.io/GOAD/providers/)
-- [Серия вокэраундов GOAD от Mayfly](https://mayfly277.github.io/categories/goad/) — самые глубокие опубликованные разборы; GOAD-Mini это подмножество глав про sevenkingdoms, поэтому [часть 2 (поиск пользователей)](https://mayfly277.github.io/posts/GOADv2-pwning-part2/) и [часть 3 (энумерация с пользователем)](https://mayfly277.github.io/posts/GOADv2-pwning-part3/) ложатся почти напрямую
-- [bloodyAD](https://github.com/CravateRouge/bloodyAD) · [NetExec](https://www.netexec.wiki/) · [Certipy](https://github.com/ly4k/Certipy) · [The Hacker Recipes — AD](https://www.thehacker.recipes/ad/movement/dacl)
+MATCH p=(u)-[r1]->(n)
+WHERE 
+  r1.isacl = true AND 
+  NOT toLower(u.name) CONTAINS 'vagrant' AND 
+  u.admincount = false AND 
+  NOT toLower(u.name) CONTAINS 'key' 
+RETURN p
